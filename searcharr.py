@@ -12,11 +12,13 @@ import sqlite3
 from threading import Lock
 from urllib.parse import parse_qsl
 import uuid
+import pytz
 from datetime import datetime
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.error import BadRequest
-from telegram.ext import Updater, CommandHandler, CallbackQueryHandler
+from telegram.ext import CommandHandler, CallbackQueryHandler, \
+    ApplicationBuilder
 
 from log import set_up_logger
 import radarr
@@ -30,6 +32,16 @@ DBPATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "data")
 DBFILE = "searcharr.db"
 DBLOCK = Lock()
 
+
+class SettingsHelper:
+    def __init__(self, prefix, remap=None):
+        self.prefix = prefix
+        self.remap = remap
+
+    def __getattr__(self, name):
+        if self.remap and name.startswith(self.prefix):
+            name = name.replace(self.prefix, self.remap, 1)
+        return getattr(settings, name)
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -67,6 +79,9 @@ class Searcharr(object):
         self._lang = self._load_language()
         if self._lang.get("language_ietf") != "en-us":
             self._lang_default = self._load_language("en-us")
+        self.readarr_settings = SettingsHelper("readarr_")
+        self.listenarr_settings = SettingsHelper("readarr_", "listenarr_")
+
         self.sonarr = (
             sonarr.Sonarr(settings.sonarr_url, settings.sonarr_api_key, args.verbose)
             if settings.sonarr_enabled
@@ -385,6 +400,134 @@ class Searcharr(object):
             for t in settings.readarr_forced_tags:
                 if t_id := self.readarr.get_tag_id(t):
                     logger.debug(f"Tag id [{t_id}] for forced Readarr tag [{t}]")
+                    logger.debug(f"Tag id [{t_id}] for forced Radarr tag [{t}]")
+
+        if hasattr(settings, "listenarr_enabled"):
+            self.listenarr = (
+                readarr.Readarr(
+                    settings.listenarr_url, settings.listenarr_api_key, args.verbose
+                )
+                if settings.listenarr_enabled
+                else None
+            )
+        else:
+            settings.listenarr_enabled = False
+            self.listenarr = None
+            logger.warning(
+                "No listenarr_enabled setting found. If you want Searcharr to support Readarr for audiobooks (Listenarr), please refer to the sample settings on github and add settings for Readarr as listenarr to settings.py."
+            )
+        if self.listenarr:
+            quality_profiles = []
+            if not isinstance(settings.listenarr_quality_profile_id, list):
+                settings.listenarr_quality_profile_id = [
+                    settings.listenarr_quality_profile_id
+                ]
+            for i in settings.listenarr_quality_profile_id:
+                logger.debug(
+                    f"Looking up/validating Listenarr quality profile id for [{i}]..."
+                )
+                foundProfile = self.listenarr.lookup_quality_profile(i)
+                if not foundProfile:
+                    logger.error(f"Listenarr quality profile id/name [{i}] is invalid!")
+                else:
+                    logger.debug(
+                        f"Found Listenarr quality profile for [{i}]: [{foundProfile}]"
+                    )
+                    quality_profiles.append(foundProfile)
+            if not len(quality_profiles):
+                logger.warning(
+                    f"No valid Listenarr quality profile(s) provided! Using all of the quality profiles I found in Listenarr: {self.listenarr._quality_profiles}"
+                )
+            else:
+                logger.debug(
+                    f"Using the following Listenarr quality profile(s): {[(x['id'], x['name']) for x in quality_profiles]}"
+                )
+                self.listenarr._quality_profiles = quality_profiles
+            metadata_profiles = []
+            if not isinstance(settings.listenarr_metadata_profile_id, list):
+                settings.listenarr_metadata_profile_id = [
+                    settings.listenarr_metadata_profile_id
+                ]
+            for i in settings.listenarr_metadata_profile_id:
+                logger.debug(
+                    f"Looking up/validating Listenarr metadata profile id for [{i}]..."
+                )
+                foundProfile = self.listenarr.lookup_metadata_profile(i)
+                if not foundProfile:
+                    logger.error(f"Listenarr metadata profile id/name [{i}] is invalid!")
+                else:
+                    logger.debug(
+                        f"Found Listenarr metadata profile for [{i}]: [{foundProfile}]"
+                    )
+                    metadata_profiles.append(foundProfile)
+            if not len(metadata_profiles):
+                logger.warning(
+                    f"No valid Listenarr metadata profile(s) provided! Using all of the metadata profiles I found in Listenarr: {self.listenarr._metadata_profiles}"
+                )
+            else:
+                logger.debug(
+                    f"Using the following Listenarr metadata profile(s): {[(x['id'], x['name']) for x in metadata_profiles]}"
+                )
+                self.listenarr._metadata_profiles = metadata_profiles
+
+            root_folders = []
+            if not hasattr(settings, "listenarr_book_paths"):
+                settings.listenarr_book_paths = []
+                logger.warning(
+                    'No listenarr_book_paths setting detected. Please set one in settings.py (listenarr_book_paths=["/path/1", "/path/2"]). Proceeding with all root folders configured in Listenarr.'
+                )
+            if not isinstance(settings.listenarr_book_paths, list):
+                settings.listenarr_book_paths = [settings.listenarr_book_paths]
+            for i in settings.listenarr_book_paths:
+                logger.debug(f"Looking up/validating Listenarr root folder for [{i}]...")
+                foundPath = self.listenarr.lookup_root_folder(i)
+                if not foundPath:
+                    logger.error(f"Listenarr root folder path/id [{i}] is invalid!")
+                else:
+                    logger.debug(f"Found Listenarr root folder for [{i}]: [{foundPath}]")
+                    root_folders.append(foundPath)
+            if not len(root_folders):
+                logger.warning(
+                    f"No valid Listenarr root folder(s) provided! Using all of the root folders I found in Listenarr: {self.listenarr._root_folders}"
+                )
+            else:
+                logger.debug(
+                    f"Using the following Listenarr root folder(s): {[(x['id'], x['path']) for x in root_folders]}"
+                )
+                self.listenarr._root_folders = root_folders
+            if not hasattr(settings, "listenarr_tag_with_username"):
+                settings.listenarr_tag_with_username = True
+                logger.warning(
+                    "No listenarr_tag_with_username setting found. Please add listenarr_tag_with_username to settings.py (listenarr_tag_with_username=True or listenarr_tag_with_username=False). Defaulting to True."
+                )
+            if not hasattr(settings, "listenarr_book_command_aliases"):
+                settings.listenarr_book_command_aliases = ["book"]
+                logger.warning(
+                    'No listenarr_book_command_aliases setting found. Please add listenarr_book_command_aliases to settings.py (e.g. listenarr_book_command_aliases=["book", "bk"]. Defaulting to ["book"].'
+                )
+            if not hasattr(settings, "listenarr_forced_tags"):
+                settings.listenarr_forced_tags = []
+                logger.warning(
+                    'No listenarr_forced_tags setting found. Please add listenarr_forced_tags to settings.py (e.g. listenarr_forced_tags=["tag-1", "tag-2"]) if you want specific tags added to each book. Defaulting to empty list ([]).'
+                )
+            if not hasattr(settings, "listenarr_allow_user_to_select_tags"):
+                settings.listenarr_allow_user_to_select_tags = True
+                logger.warning(
+                    "No listenarr_allow_user_to_select_tags setting found. Please add listenarr_allow_user_to_select_tags to settings.py (e.g. listenarr_allow_user_to_select_tags=False) if you do not want users to be able to select tags when adding a book. Defaulting to True."
+                )
+            if not hasattr(settings, "listenarr_user_selectable_tags"):
+                settings.listenarr_user_selectable_tags = []
+                logger.warning(
+                    'No listenarr_user_selectable_tags setting found. Please add listenarr_user_selectable_tags to settings.py (e.g. listenarr_user_selectable_tags=["tag-1", "tag-2"]) if you want to limit the tags a user can select. Defaulting to empty list ([]), which will present the user with all tags.'
+                )
+            for t in settings.listenarr_user_selectable_tags:
+                if t_id := self.listenarr.get_tag_id(t):
+                    logger.debug(
+                        f"Tag id [{t_id}] for user-selectable Listenarr tag [{t}]"
+                    )
+            for t in settings.listenarr_forced_tags:
+                if t_id := self.listenarr.get_tag_id(t):
+                    logger.debug(f"Tag id [{t_id}] for forced Listenarr tag [{t}]")
 
         self.conversations = {}
         if not hasattr(settings, "searcharr_admin_password"):
@@ -412,7 +555,7 @@ class Searcharr(object):
                 'No searcharr_users_command_aliases setting found. Please add searcharr_users_command_aliases to settings.py (e.g. searcharr_users_command_aliases=["users"]. Defaulting to ["users"].'
             )
 
-    def cmd_start(self, update, context):
+    async def cmd_start(self, update, context):
         logger.debug(f"Received start cmd from [{update.message.from_user.username}]")
         password = self._strip_entities(update.message)
         if password and password == settings.searcharr_admin_password:
@@ -421,7 +564,7 @@ class Searcharr(object):
                 username=str(update.message.from_user.username),
                 admin=1,
             )
-            update.message.reply_text(
+            await update.message.reply_text(
                 self._xlate(
                     "admin_auth_success",
                     commands=" OR ".join(
@@ -430,7 +573,7 @@ class Searcharr(object):
                 )
             )
         elif self._authenticated(update.message.from_user.id):
-            update.message.reply_text(
+            await update.message.reply_text(
                 self._xlate(
                     "already_authenticated",
                     commands=" OR ".join(
@@ -443,7 +586,7 @@ class Searcharr(object):
                 id=update.message.from_user.id,
                 username=str(update.message.from_user.username),
             )
-            update.message.reply_text(
+            await update.message.reply_text(
                 self._xlate(
                     "auth_successful",
                     commands=" OR ".join(
@@ -452,71 +595,78 @@ class Searcharr(object):
                 )
             )
         else:
-            update.message.reply_text(self._xlate("incorrect_pw"))
+            await update.message.reply_text(self._xlate("incorrect_pw"))
 
-    def cmd_book(self, update, context):
-        logger.debug(f"Received book cmd from [{update.message.from_user.username}]")
+    async def cmd_book(self, update, context):
+        return await self.cmd_handle_readarr(update, context, self.readarr, self.readarr_settings, "book")
+
+    async def cmd_audiobook(self, update, context):
+        return await self.cmd_handle_readarr(update, context, self.listenarr, self.listenarr_settings, "audiobook")
+
+    async def cmd_handle_readarr(self, update, context, source, current_settings, convo_type):
+        logger.debug(f"Received {convo_type} cmd from [{update.message.from_user.username}]")
         if not self._authenticated(update.message.from_user.id):
-            update.message.reply_text(
+            await update.message.reply_text(
                 self._xlate(
                     "auth_required",
                     commands=" OR ".join(
                         [
                             f"`/{c} <{self._xlate('password')}>`"
-                            for c in settings.searcharr_start_command_aliases
+                            for c in current_settings.searcharr_start_command_aliases
                         ]
                     ),
                 )
             )
             return
-        if not settings.readarr_enabled:
-            update.message.reply_text(self._xlate("readarr_disabled"))
+        if not current_settings.readarr_enabled:
+            await update.message.reply_text(self._xlate("readarr_disabled"))
             return
         title = self._strip_entities(update.message)
         if not len(title):
             x_title = self._xlate("title").title()
-            update.message.reply_text(
+            await update.message.reply_text(
                 self._xlate(
                     "include_book_title_in_cmd",
                     commands=" OR ".join(
                         [
                             f"`/{c} {x_title}`"
-                            for c in settings.readarr_book_command_aliases
+                            for c in current_settings.readarr_book_command_aliases
                         ]
                     ),
                 )
             )
             return
-        results = self.readarr.lookup_book(title)
+        results = source.lookup_book(title)
         cid = self._generate_cid()
         # self.conversations.update({cid: {"cid": cid, "type": "book", "results": results}})
         self._create_conversation(
             id=cid,
             username=str(update.message.from_user.username),
-            kind="book",
+            kind=convo_type,
             results=results,
         )
 
         if not len(results):
-            update.message.reply_text(self._xlate("no_matching_books"))
+            await update.message.reply_text(self._xlate("no_matching_books"))
         else:
             r = results[0]
             reply_message, reply_markup = self._prepare_response(
-                "book", r, cid, 0, len(results)
+                convo_type, r, cid, 0, len(results)
             )
             try:
-                context.bot.sendPhoto(
+                await context.bot.sendPhoto(
                     chat_id=update.message.chat.id,
                     photo=r["remotePoster"],
                     caption=reply_message,
                     reply_markup=reply_markup,
                 )
             except BadRequest as e:
+                print('error sending photo', e)
                 if str(e) in self._bad_request_poster_error_messages:
                     logger.error(
                         f"Error sending photo [{r['remotePoster']}]: BadRequest: {e}. Attempting to send with default poster..."
                     )
-                    context.bot.sendPhoto(
+                    await context.bot.sendPhoto(
                         chat_id=update.message.chat.id,
                         photo="https://artworks.thetvdb.com/banners/images/missing/movie.jpg",
                         caption=reply_message,
@@ -525,10 +675,10 @@ class Searcharr(object):
                 else:
                     raise
 
-    def cmd_movie(self, update, context):
+    async def cmd_movie(self, update, context):
         logger.debug(f"Received movie cmd from [{update.message.from_user.username}]")
         if not self._authenticated(update.message.from_user.id):
-            update.message.reply_text(
+            await update.message.reply_text(
                 self._xlate(
                     "auth_required",
                     commands=" OR ".join(
@@ -541,12 +691,12 @@ class Searcharr(object):
             )
             return
         if not settings.radarr_enabled:
-            update.message.reply_text(self._xlate("radarr_disabled"))
+            await update.message.reply_text(self._xlate("radarr_disabled"))
             return
         title = self._strip_entities(update.message)
         if not len(title):
             x_title = self._xlate("title").title()
-            update.message.reply_text(
+            await update.message.reply_text(
                 self._xlate(
                     "include_movie_title_in_cmd",
                     commands=" OR ".join(
@@ -569,14 +719,14 @@ class Searcharr(object):
         )
 
         if not len(results):
-            update.message.reply_text(self._xlate("no_matching_movies"))
+            await update.message.reply_text(self._xlate("no_matching_movies"))
         else:
             r = results[0]
             reply_message, reply_markup = self._prepare_response(
                 "movie", r, cid, 0, len(results)
             )
             try:
-                context.bot.sendPhoto(
+                await context.bot.sendPhoto(
                     chat_id=update.message.chat.id,
                     photo=r["remotePoster"],
                     caption=reply_message,
@@ -587,7 +737,7 @@ class Searcharr(object):
                     logger.error(
                         f"Error sending photo [{r['remotePoster']}]: BadRequest: {e}. Attempting to send with default poster..."
                     )
-                    context.bot.sendPhoto(
+                    await context.bot.sendPhoto(
                         chat_id=update.message.chat.id,
                         photo="https://artworks.thetvdb.com/banners/images/missing/movie.jpg",
                         caption=reply_message,
@@ -596,10 +746,10 @@ class Searcharr(object):
                 else:
                     raise
 
-    def cmd_series(self, update, context):
+    async def cmd_series(self, update, context):
         logger.debug(f"Received series cmd from [{update.message.from_user.username}]")
         if not self._authenticated(update.message.from_user.id):
-            update.message.reply_text(
+            await update.message.reply_text(
                 self._xlate(
                     "auth_required",
                     commands=" OR ".join(
@@ -612,12 +762,12 @@ class Searcharr(object):
             )
             return
         if not settings.sonarr_enabled:
-            update.message.reply_text(self._xlate("sonarr_disabled"))
+            await update.message.reply_text(self._xlate("sonarr_disabled"))
             return
         title = self._strip_entities(update.message)
         if not len(title):
             x_title = self._xlate("title").title()
-            update.message.reply_text(
+            await update.message.reply_text(
                 self._xlate(
                     "include_series_title_in_cmd",
                     commands=" OR ".join(
@@ -640,14 +790,14 @@ class Searcharr(object):
         )
 
         if not len(results):
-            update.message.reply_text(self._xlate("no_matching_series"))
+            await update.message.reply_text(self._xlate("no_matching_series"))
         else:
             r = results[0]
             reply_message, reply_markup = self._prepare_response(
                 "series", r, cid, 0, len(results)
             )
             try:
-                context.bot.sendPhoto(
+                await context.bot.sendPhoto(
                     chat_id=update.message.chat.id,
                     photo=r["remotePoster"],
                     caption=reply_message,
@@ -658,7 +808,7 @@ class Searcharr(object):
                     logger.error(
                         f"Error sending photo [{r['remotePoster']}]: BadRequest: {e}. Attempting to send with default poster..."
                     )
-                    context.bot.sendPhoto(
+                    await context.bot.sendPhoto(
                         chat_id=update.message.chat.id,
                         photo="https://artworks.thetvdb.com/banners/images/missing/movie.jpg",
                         caption=reply_message,
@@ -667,11 +817,11 @@ class Searcharr(object):
                 else:
                     raise
 
-    def cmd_users(self, update, context):
+    async def cmd_users(self, update, context):
         logger.debug(f"Received users cmd from [{update.message.from_user.username}]")
         auth_level = self._authenticated(update.message.from_user.id)
         if not auth_level:
-            update.message.reply_text(
+            await update.message.reply_text(
                 self._xlate(
                     "auth_required",
                     commands=" OR ".join(
@@ -684,7 +834,7 @@ class Searcharr(object):
             )
             return
         elif auth_level != 2:
-            update.message.reply_text(
+            await update.message.reply_text(
                 self._xlate(
                     "admin_auth_required",
                     commands=" OR ".join(
@@ -707,7 +857,7 @@ class Searcharr(object):
             results=results,
         )
         if not len(results):
-            update.message.reply_text(self._xlate("no_users_found"))
+            await update.message.reply_text(self._xlate("no_users_found"))
         else:
             reply_message, reply_markup = self._prepare_response_users(
                 cid,
@@ -722,14 +872,14 @@ class Searcharr(object):
                 reply_markup=reply_markup,
             )
 
-    def callback(self, update, context):
+    async def callback(self, update, context):
         query = update.callback_query
         logger.debug(
             f"Received callback from [{query.from_user.username}]: [{query.data}]"
         )
         auth_level = self._authenticated(query.from_user.id)
         if not auth_level:
-            query.message.reply_text(
+            await query.message.reply_text(
                 self._xlate(
                     "auth_required",
                     commands=" OR ".join(
@@ -740,20 +890,20 @@ class Searcharr(object):
                     ),
                 )
             )
-            query.message.delete()
-            query.answer()
+            await query.message.delete()
+            await query.answer()
             return
 
         if not query.data or not len(query.data):
-            query.answer()
+            await query.answer()
             return
 
         convo = self._get_conversation(query.data.split("^^^")[0])
         # convo = self.conversations.get(query.data.split("^^^")[0])
         if not convo:
-            query.message.reply_text(self._xlate("convo_not_found"))
-            query.message.delete()
-            query.answer()
+            await query.message.reply_text(self._xlate("convo_not_found"))
+            await query.message.delete()
+            await query.answer()
             return
 
         cid, i, op = query.data.split("^^^")
@@ -771,23 +921,23 @@ class Searcharr(object):
         elif op == "cancel":
             self._delete_conversation(cid)
             # self.conversations.pop(cid)
-            query.message.reply_text(self._xlate("search_canceled"))
-            query.message.delete()
+            await query.message.reply_text(self._xlate("search_canceled"))
+            await query.message.delete()
         elif op == "done":
             self._delete_conversation(cid)
             # self.conversations.pop(cid)
-            query.message.delete()
+            await query.message.delete()
         elif op == "prev":
-            if convo["type"] in ["series", "movie", "book"]:
+            if convo["type"] in ["series", "movie", "book", "audiobook"]:
                 if i <= 0:
-                    query.answer()
+                    await query.answer()
                     return
                 r = convo["results"][i - 1]
                 reply_message, reply_markup = self._prepare_response(
                     convo["type"], r, cid, i - 1, len(convo["results"])
                 )
                 try:
-                    query.message.edit_media(
+                    await query.message.edit_media(
                         media=InputMediaPhoto(r["remotePoster"]),
                         reply_markup=reply_markup,
                     )
@@ -796,7 +946,7 @@ class Searcharr(object):
                         logger.error(
                             f"Error sending photo [{r['remotePoster']}]: BadRequest: {e}. Attempting to send with default poster..."
                         )
-                        query.message.edit_media(
+                        await query.message.edit_media(
                             media=InputMediaPhoto(
                                 "https://artworks.thetvdb.com/banners/images/missing/movie.jpg"
                             ),
@@ -804,7 +954,7 @@ class Searcharr(object):
                         )
                     else:
                         raise
-                query.bot.edit_message_caption(
+                await context.bot.edit_message_caption(
                     chat_id=query.message.chat_id,
                     message_id=query.message.message_id,
                     caption=reply_message,
@@ -827,9 +977,9 @@ class Searcharr(object):
                     reply_markup=reply_markup,
                 )
         elif op == "next":
-            if convo["type"] in ["series", "movie", "book"]:
+            if convo["type"] in ["series", "movie", "book", "audiobook"]:
                 if i >= len(convo["results"]):
-                    query.answer()
+                    await query.answer()
                     return
                 r = convo["results"][i + 1]
                 logger.debug(f"{r=}")
@@ -837,7 +987,7 @@ class Searcharr(object):
                     convo["type"], r, cid, i + 1, len(convo["results"])
                 )
                 try:
-                    query.message.edit_media(
+                    await query.message.edit_media(
                         media=InputMediaPhoto(r["remotePoster"]),
                         reply_markup=reply_markup,
                     )
@@ -846,7 +996,7 @@ class Searcharr(object):
                         logger.error(
                             f"Error sending photo [{r['remotePoster']}]: BadRequest: {e}. Attempting to send with default poster..."
                         )
-                        query.message.edit_media(
+                        await query.message.edit_media(
                             media=InputMediaPhoto(
                                 "https://artworks.thetvdb.com/banners/images/missing/movie.jpg"
                             ),
@@ -854,7 +1004,7 @@ class Searcharr(object):
                         )
                     else:
                         raise
-                query.bot.edit_message_caption(
+                await context.bot.edit_message_caption(
                     chat_id=query.message.chat_id,
                     message_id=query.message.message_id,
                     caption=reply_message,
@@ -862,7 +1012,7 @@ class Searcharr(object):
                 )
             elif convo["type"] == "users":
                 if i > len(convo["results"]):
-                    query.answer()
+                    await query.answer()
                     return
                 reply_message, reply_markup = self._prepare_response_users(
                     cid,
@@ -888,6 +1038,8 @@ class Searcharr(object):
                 if convo["type"] == "movie"
                 else self.readarr._root_folders
                 if convo["type"] == "book"
+                else self.listenarr._root_folders
+                if convo["type"] == "audiobook"
                 else []
             )
             if not additional_data.get("p"):
@@ -902,7 +1054,7 @@ class Searcharr(object):
                         paths=paths,
                     )
                     try:
-                        query.message.edit_media(
+                        await query.message.edit_media(
                             media=InputMediaPhoto(r["remotePoster"]),
                             reply_markup=reply_markup,
                         )
@@ -911,7 +1063,7 @@ class Searcharr(object):
                             logger.error(
                                 f"Error sending photo [{r['remotePoster']}]: BadRequest: {e}. Attempting to send with default poster..."
                             )
-                            query.message.edit_media(
+                            await query.message.edit_media(
                                 media=InputMediaPhoto(
                                     "https://artworks.thetvdb.com/banners/images/missing/movie.jpg"
                                 ),
@@ -919,13 +1071,13 @@ class Searcharr(object):
                             )
                         else:
                             raise
-                    query.bot.edit_message_caption(
+                    await context.bot.edit_message_caption(
                         chat_id=query.message.chat_id,
                         message_id=query.message.message_id,
                         caption=reply_message,
                         reply_markup=reply_markup,
                     )
-                    query.answer()
+                    await query.answer()
                     return
                 elif len(paths) == 1:
                     logger.debug(
@@ -934,7 +1086,7 @@ class Searcharr(object):
                     self._update_add_data(cid, "p", paths[0]["path"])
                 else:
                     self._delete_conversation(cid)
-                    query.message.reply_text(
+                    await query.message.reply_text(
                         self._xlate(
                             "no_root_folders",
                             kind=self._xlate(convo["type"]),
@@ -944,11 +1096,13 @@ class Searcharr(object):
                             if convo["type"] == "movie"
                             else "Readarr"
                             if convo["type"] == "book"
+                            else "???"
+                            if convo["type"] == "audiobook"
                             else "???",
                         )
                     )
-                    query.message.delete()
-                    query.answer()
+                    await query.message.delete()
+                    await query.answer()
                     return
             else:
                 try:
@@ -979,6 +1133,10 @@ class Searcharr(object):
                     else self.radarr._quality_profiles
                     if convo["type"] == "movie"
                     else self.readarr._quality_profiles
+                    if convo["type"] == "book"
+                    else self.listenarr._quality_profiles
+                    if convo["type"] == "audiobook"
+                    else []
                 )
                 if len(quality_profiles) > 1:
                     # prepare response to prompt user to select quality profile, and return
@@ -992,7 +1150,7 @@ class Searcharr(object):
                         quality_profiles=quality_profiles,
                     )
                     try:
-                        query.message.edit_media(
+                        await query.message.edit_media(
                             media=InputMediaPhoto(r["remotePoster"]),
                             reply_markup=reply_markup,
                         )
@@ -1001,7 +1159,7 @@ class Searcharr(object):
                             logger.error(
                                 f"Error sending photo [{r['remotePoster']}]: BadRequest: {e}. Attempting to send with default poster..."
                             )
-                            query.message.edit_media(
+                            await query.message.edit_media(
                                 media=InputMediaPhoto(
                                     "https://artworks.thetvdb.com/banners/images/missing/movie.jpg"
                                 ),
@@ -1009,13 +1167,13 @@ class Searcharr(object):
                             )
                         else:
                             raise
-                    query.bot.edit_message_caption(
+                    await context.bot.edit_message_caption(
                         chat_id=query.message.chat_id,
                         message_id=query.message.message_id,
                         caption=reply_message,
                         reply_markup=reply_markup,
                     )
-                    query.answer()
+                    await query.answer()
                     return
                 elif len(quality_profiles) == 1:
                     logger.debug(
@@ -1024,7 +1182,7 @@ class Searcharr(object):
                     self._update_add_data(cid, "q", quality_profiles[0]["id"])
                 else:
                     self._delete_conversation(cid)
-                    query.message.reply_text(
+                    await query.message.reply_text(
                         self._xlate(
                             "no_quality_profiles",
                             kind=self._xlate(convo["type"]),
@@ -1032,11 +1190,13 @@ class Searcharr(object):
                             if convo["type"] == "series"
                             else "Radarr"
                             if convo["type"] == "movie"
-                            else "Readarr",
+                            else "Readarr"
+                            if convo["type"] == "book"
+                            else "Listenarr",
                         )
                     )
-                    query.message.delete()
-                    query.answer()
+                    await query.message.delete()
+                    await query.answer()
                     return
 
             if convo["type"] == "book" and not additional_data.get("m"):
@@ -1053,7 +1213,7 @@ class Searcharr(object):
                         metadata_profiles=metadata_profiles,
                     )
                     try:
-                        query.message.edit_media(
+                        await query.message.edit_media(
                             media=InputMediaPhoto(r["remotePoster"]),
                             reply_markup=reply_markup,
                         )
@@ -1062,7 +1222,7 @@ class Searcharr(object):
                             logger.error(
                                 f"Error sending photo [{r['remotePoster']}]: BadRequest: {e}. Attempting to send with default poster..."
                             )
-                            query.message.edit_media(
+                            await query.message.edit_media(
                                 media=InputMediaPhoto(
                                     "https://artworks.thetvdb.com/banners/images/missing/movie.jpg"
                                 ),
@@ -1070,13 +1230,13 @@ class Searcharr(object):
                             )
                         else:
                             raise
-                    query.bot.edit_message_caption(
+                    await context.bot.edit_message_caption(
                         chat_id=query.message.chat_id,
                         message_id=query.message.message_id,
                         caption=reply_message,
                         reply_markup=reply_markup,
                     )
-                    query.answer()
+                    await query.answer()
                     return
                 elif len(metadata_profiles) == 1:
                     logger.debug(
@@ -1085,7 +1245,7 @@ class Searcharr(object):
                     self._update_add_data(cid, "m", metadata_profiles[0]["id"])
                 else:
                     self._delete_conversation(cid)
-                    query.message.reply_text(
+                    await query.message.reply_text(
                         self._xlate(
                             "no_metadata_profiles",
                             kind=self._xlate(convo["type"]),
@@ -1096,8 +1256,71 @@ class Searcharr(object):
                             else "Readarr",
                         )
                     )
-                    query.message.delete()
-                    query.answer()
+                    await query.message.delete()
+                    await query.answer()
+                    return
+
+            if convo["type"] == "audiobook" and not additional_data.get("m"):
+                metadata_profiles = self.listenarr._metadata_profiles
+                if len(metadata_profiles) > 1:
+                    # prepare response to prompt user to select quality profile, and return
+                    reply_message, reply_markup = self._prepare_response(
+                        convo["type"],
+                        r,
+                        cid,
+                        i,
+                        len(convo["results"]),
+                        add=True,
+                        metadata_profiles=metadata_profiles,
+                    )
+                    try:
+                        await query.message.edit_media(
+                            media=InputMediaPhoto(r["remotePoster"]),
+                            reply_markup=reply_markup,
+                        )
+                    except BadRequest as e:
+                        if str(e) in self._bad_request_poster_error_messages:
+                            logger.error(
+                                f"Error sending photo [{r['remotePoster']}]: BadRequest: {e}. Attempting to send with default poster..."
+                            )
+                            await query.message.edit_media(
+                                media=InputMediaPhoto(
+                                    "https://artworks.thetvdb.com/banners/images/missing/movie.jpg"
+                                ),
+                                reply_markup=reply_markup,
+                            )
+                        else:
+                            raise
+                    await context.bot.edit_message_caption(
+                        chat_id=query.message.chat_id,
+                        message_id=query.message.message_id,
+                        caption=reply_message,
+                        reply_markup=reply_markup,
+                    )
+                    await query.answer()
+                    return
+                elif len(metadata_profiles) == 1:
+                    logger.debug(
+                        f"Only one metadata profile enabled. Adding/Updating additional data for cid=[{cid}], key=[m], value=[{metadata_profiles[0]['id']}]..."
+                    )
+                    self._update_add_data(cid, "m", metadata_profiles[0]["id"])
+                else:
+                    self._delete_conversation(cid)
+                    await query.message.reply_text(
+                        self._xlate(
+                            "no_metadata_profiles",
+                            kind=self._xlate(convo["type"]),
+                            app="Sonarr"
+                            if convo["type"] == "series"
+                            else "Radarr"
+                            if convo["type"] == "movie"
+                            else "Readarr"
+                            if convo["type"] == "book"
+                            else "Listenarr",
+                        )
+                    )
+                    await query.message.delete()
+                    await query.answer()
                     return
 
             if (
@@ -1122,7 +1345,7 @@ class Searcharr(object):
                     monitor_options=monitor_options,
                 )
                 try:
-                    query.message.edit_media(
+                    await query.message.edit_media(
                         media=InputMediaPhoto(r["remotePoster"]),
                         reply_markup=reply_markup,
                     )
@@ -1131,7 +1354,7 @@ class Searcharr(object):
                         logger.error(
                             f"Error sending photo [{r['remotePoster']}]: BadRequest: {e}. Attempting to send with default poster..."
                         )
-                        query.message.edit_media(
+                        await query.message.edit_media(
                             media=InputMediaPhoto(
                                 "https://artworks.thetvdb.com/banners/images/missing/movie.jpg"
                             ),
@@ -1139,13 +1362,13 @@ class Searcharr(object):
                         )
                     else:
                         raise
-                query.bot.edit_message_caption(
+                await context.bot.edit_message_caption(
                     chat_id=query.message.chat_id,
                     message_id=query.message.message_id,
                     caption=reply_message,
                     reply_markup=reply_markup,
                 )
-                query.answer()
+                await query.answer()
                 return
 
             if convo["type"] == "series":
@@ -1169,6 +1392,13 @@ class Searcharr(object):
                 )
                 allow_user_to_select_tags = settings.readarr_allow_user_to_select_tags
                 forced_tags = settings.readarr_forced_tags
+            elif convo["type"] == "audiobook":
+                all_tags = self.listenarr.get_filtered_tags(
+                    settings.listenarr_user_selectable_tags,
+                    settings.listenarr_forced_tags,
+                )
+                allow_user_to_select_tags = settings.listenarr_allow_user_to_select_tags
+                forced_tags = settings.listenarr_forced_tags
             if allow_user_to_select_tags and not additional_data.get("td"):
                 if not len(all_tags):
                     logger.warning(
@@ -1185,7 +1415,7 @@ class Searcharr(object):
                         tags=all_tags,
                     )
                     try:
-                        query.message.edit_media(
+                        await query.message.edit_media(
                             media=InputMediaPhoto(r["remotePoster"]),
                             reply_markup=reply_markup,
                         )
@@ -1194,7 +1424,7 @@ class Searcharr(object):
                             logger.error(
                                 f"Error sending photo [{r['remotePoster']}]: BadRequest: {e}. Attempting to send with default poster..."
                             )
-                            query.message.edit_media(
+                            await query.message.edit_media(
                                 media=InputMediaPhoto(
                                     "https://artworks.thetvdb.com/banners/images/missing/movie.jpg"
                                 ),
@@ -1202,13 +1432,13 @@ class Searcharr(object):
                             )
                         else:
                             raise
-                    query.bot.edit_message_caption(
+                    await context.bot.edit_message_caption(
                         chat_id=query.message.chat_id,
                         message_id=query.message.message_id,
                         caption=reply_message,
                         reply_markup=reply_markup,
                     )
-                    query.answer()
+                    await query.answer()
                     return
                 else:
                     tag_ids = (
@@ -1236,6 +1466,10 @@ class Searcharr(object):
             elif convo["type"] == "book":
                 get_tag_id = self.readarr.get_tag_id
                 tag_with_username = settings.readarr_tag_with_username
+                tag_with_username = settings.radarr_tag_with_username
+            elif convo["type"] == "audiobook":
+                get_tag_id = self.listenarr.get_tag_id
+                tag_with_username = settings.listenarr_tag_with_username
             if tag_with_username:
                 tag = f"searcharr-{query.from_user.username if query.from_user.username else query.from_user.id}"
                 if tag_id := get_tag_id(tag):
@@ -1277,6 +1511,13 @@ class Searcharr(object):
                         search=settings.readarr_search_on_add,
                         additional_data=self._get_add_data(cid),
                     )
+                elif convo["type"] == "audiobook":
+                    added = self.listenarr.add_book(
+                        book_info=r,
+                        monitored=settings.listenarr_add_monitored,
+                        search=settings.listenarr_search_on_add,
+                        additional_data=self._get_add_data(cid),
+                    )
                 else:
                     added = False
             except Exception as e:
@@ -1285,15 +1526,15 @@ class Searcharr(object):
             logger.debug(f"Result of attempt to add {convo['type']}: {added}")
             if added:
                 self._delete_conversation(cid)
-                query.message.reply_text(self._xlate("added", title=r["title"]))
-                query.message.delete()
+                await query.message.reply_text(self._xlate("added", title=r["title"]))
+                await query.message.delete()
             else:
-                query.message.reply_text(
+                await query.message.reply_text(
                     self._xlate("unknown_error_adding", kind=convo["type"])
                 )
         elif op == "remove_user":
             if auth_level != 2:
-                query.message.reply_text(
+                await query.message.reply_text(
                     self._xlate(
                         "admin_auth_required",
                         commands=" OR ".join(
@@ -1304,8 +1545,8 @@ class Searcharr(object):
                         ),
                     )
                 )
-                query.message.delete()
-                query.answer()
+                await query.message.delete()
+                await query.answer()
                 return
             try:
                 self._remove_user(i)
@@ -1336,12 +1577,12 @@ class Searcharr(object):
                 )
             except Exception as e:
                 logger.error(f"Error removing all access for user id [{i}]: {e}")
-                query.message.reply_text(
+                await query.message.reply_text(
                     self._xlate("unknown_error_removing_user", user=i)
                 )
         elif op == "make_admin":
             if auth_level != 2:
-                query.message.reply_text(
+                await query.message.reply_text(
                     self._xlate(
                         "admin_auth_required",
                         commands=" OR ".join(
@@ -1352,8 +1593,8 @@ class Searcharr(object):
                         ),
                     )
                 )
-                query.message.delete()
-                query.answer()
+                await query.message.delete()
+                await query.answer()
                 return
             try:
                 self._update_admin_access(i, 1)
@@ -1382,12 +1623,12 @@ class Searcharr(object):
                 )
             except Exception as e:
                 logger.error(f"Error adding admin access for user id [{i}]: {e}")
-                query.message.reply_text(
+                await query.message.reply_text(
                     self._xlate("unknown_error_adding_admin", user=i)
                 )
         elif op == "remove_admin":
             if auth_level != 2:
-                query.message.reply_text(
+                await query.message.reply_text(
                     self._xlate(
                         "admin_auth_required",
                         commands=" OR ".join(
@@ -1398,8 +1639,8 @@ class Searcharr(object):
                         ),
                     )
                 )
-                query.message.delete()
-                query.answer()
+                await query.message.delete()
+                await query.answer()
                 return
             try:
                 self._update_admin_access(i, "")
@@ -1428,11 +1669,11 @@ class Searcharr(object):
                 )
             except Exception as e:
                 logger.error(f"Error removing admin access for user id [{i}]: {e}")
-                query.message.reply_text(
+                await query.message.reply_text(
                     self._xlate("unknown_error_removing_admin", user=i)
                 )
 
-        query.answer()
+        await query.answer()
 
     def _prepare_response(
         self,
@@ -1469,6 +1710,11 @@ class Searcharr(object):
                 )
             )
         elif kind == "book" and r["links"]:
+            for link in r["links"]:
+                keyboardNavRow.append(
+                    InlineKeyboardButton(link["name"], url=link["url"])
+                )
+        elif kind == "audiobooks" and r["links"]:
             for link in r["links"]:
                 keyboardNavRow.append(
                     InlineKeyboardButton(link["name"], url=link["url"])
@@ -1602,6 +1848,16 @@ class Searcharr(object):
             reply_message = f"{r['author']['authorName']} - {r['title']}{' - ' + r['disambiguation'] if r['disambiguation'] else ''}{' - ' + r['seriesTitle'] if r['seriesTitle'] else ''} ({release})\n\n{r['overview']}"[
                 0:1024
             ]
+        elif kind == "audiobook":
+            try:
+                release = datetime.strptime(
+                    r["releaseDate"], "%Y-%m-%dT%H:%M:%SZ"
+                ).strftime("%b %d, %Y")
+            except (ValueError, TypeError):
+                release = "???"
+            reply_message = f"{r['author']['authorName']} - {r['title']}{' - ' + r['disambiguation'] if r['disambiguation'] else ''}{' - ' + r['seriesTitle'] if r['seriesTitle'] else ''} ({release})\n\n{r['overview']}"[
+                0:1024
+            ]
         else:
             reply_message = self._xlate("unexpected_error")
 
@@ -1657,18 +1913,18 @@ class Searcharr(object):
         )
         return (reply_message, reply_markup)
 
-    def handle_error(self, update, context):
+    async def handle_error(self, update, context):
         logger.error(f"Caught error: {context.error}")
         try:
             update.callback_query.answer()
         except Exception:
             pass
 
-    def cmd_help(self, update, context):
+    async def cmd_help(self, update, context):
         logger.debug(f"Received help cmd from [{update.message.from_user.username}]")
         auth_level = self._authenticated(update.message.from_user.id)
         if not auth_level:
-            update.message.reply_text(
+            await update.message.reply_text(
                 self._xlate(
                     "auth_required",
                     commands=" OR ".join(
@@ -1709,6 +1965,17 @@ class Searcharr(object):
                 ),
             )
 
+        if self.listenarr:
+            listenarr_help = self._xlate(
+                "help_listenarr",
+                audiobook_commands=" OR ".join(
+                    [
+                        f"`/{c} {self._xlate('title').title()}`"
+                        for c in settings.listenarr_book_command_aliases
+                    ]
+                ),
+            )
+
         if (
             settings.sonarr_enabled
             or settings.radarr_enabled
@@ -1721,6 +1988,8 @@ class Searcharr(object):
                 resp += f" {radarr_help}"
             if settings.readarr_enabled:
                 resp += f" {readarr_help}"
+            if settings.listenarr_enabled:
+                resp += f" {listenarr_help}"
         else:
             resp = self._xlate("no_features")
 
@@ -1732,7 +2001,7 @@ class Searcharr(object):
                 ),
             )
 
-        update.message.reply_text(resp)
+        await update.message.reply_text(resp)
 
     def _strip_entities(self, message):
         text = message.text
@@ -1746,37 +2015,54 @@ class Searcharr(object):
 
     def run(self):
         self._init_db()
-        updater = Updater(self.token, use_context=True)
+        # updater = Updater(self.token, use_context=True)
+        application = (
+            ApplicationBuilder()
+            .token(self.token)
+            .build()
+        )
 
         for c in settings.searcharr_help_command_aliases:
             logger.debug(f"Registering [/{c}] as a help command")
-            updater.dispatcher.add_handler(CommandHandler(c, self.cmd_help))
+            # updater.dispatcher.add_handler(CommandHandler(c, self.cmd_help))
+            application.add_handler(CommandHandler(c, self.cmd_help))
         for c in settings.searcharr_start_command_aliases:
             logger.debug(f"Registering [/{c}] as a start command")
-            updater.dispatcher.add_handler(CommandHandler(c, self.cmd_start))
+            # updater.dispatcher.add_handler(CommandHandler(c, self.cmd_start))
+            application.add_handler(CommandHandler(c, self.cmd_start))
         if self.readarr:
             for c in settings.readarr_book_command_aliases:
                 logger.debug(f"Registering [/{c}] as a book command")
-                updater.dispatcher.add_handler(CommandHandler(c, self.cmd_book))
+                # updater.dispatcher.add_handler(CommandHandler(c, self.cmd_book))
+                application.add_handler(CommandHandler(c, self.cmd_book))
+        if self.listenarr:
+            for c in self.listenarr_settings.readarr_book_command_aliases:
+                logger.debug(f"Registering [/{c}] as a book command")
+                # updater.dispatcher.add_handler(CommandHandler(c, self.cmd_audiobook))
+                application.add_handler(CommandHandler(c, self.cmd_audiobook))
         for c in settings.radarr_movie_command_aliases:
             logger.debug(f"Registering [/{c}] as a movie command")
-            updater.dispatcher.add_handler(CommandHandler(c, self.cmd_movie))
+            # updater.dispatcher.add_handler(CommandHandler(c, self.cmd_movie))
+            application.add_handler(CommandHandler(c, self.cmd_movie))
         for c in settings.sonarr_series_command_aliases:
             logger.debug(f"Registering [/{c}] as a series command")
-            updater.dispatcher.add_handler(CommandHandler(c, self.cmd_series))
+            # updater.dispatcher.add_handler(CommandHandler(c, self.cmd_series))
+            application.add_handler(CommandHandler(c, self.cmd_series))
         for c in settings.searcharr_users_command_aliases:
             logger.debug(f"Registering [/{c}] as a users command")
-            updater.dispatcher.add_handler(CommandHandler(c, self.cmd_users))
-        updater.dispatcher.add_handler(CallbackQueryHandler(self.callback))
+            # updater.dispatcher.add_handler(CommandHandler(c, self.cmd_users))
+            application.add_handler(CommandHandler(c, self.cmd_users))
+        # updater.dispatcher.add_handler(CallbackQueryHandler(self.callback))
+        application.add_handler(CallbackQueryHandler(self.callback))
         if not self.DEV_MODE:
-            updater.dispatcher.add_error_handler(self.handle_error)
+            # updater.dispatcher.add_error_handler(self.handle_error)
+            application.add_error_handler(self.handle_error)
         else:
             logger.info(
                 "Developer mode is enabled; skipping registration of error handler--exceptions will be raised."
             )
 
-        updater.start_polling()
-        updater.idle()
+        application.run_polling()
 
     def _create_conversation(self, id, username, kind, results):
         con, cur = self._get_con_cur()

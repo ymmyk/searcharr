@@ -5,6 +5,7 @@ movie: movie
 series: series
 season: season
 book: book
+audiobook: audio book
 title: title
 title_here: title here
 password: password
@@ -64,5 +65,6 @@ readarr_disabled: Sorry, but book support is disabled.
 include_book_title_in_cmd: Please include the book title in the command, e.g. {commands}
 no_matching_books: Sorry, but I didn't find any matching books.
 help_readarr: Use {book_commands} to add a book to Readarr.
+help_listenarr: Use {audiobook_commands} to add a book to Listenarr.
 no_metadata_profiles: "Error adding {kind}: no metadata profiles enabled for {app}! Please check your Searcharr configuration and try again."
 add_metadata_button: "Add Metadata: {metadata}"

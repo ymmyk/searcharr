@@ -60,3 +60,18 @@ readarr_allow_user_to_select_tags = True
 readarr_user_selectable_tags = []  # e.g. ["custom-tag-1", "custom-tag-2"] - leave empty to let user choose from all tags in Readarr
 readarr_book_command_aliases = ["book"]  # e.g. ["book", "bk", "b"]
 readarr_book_paths = []  # e.g. ["/books", "/other-books"] - can be full path or id value - leave empty to enable all
+
+# Readarr (second instance for audiobooks)
+listenarr_enabled = True
+listenarr_url = ""  # http://192.168.0.100:8787
+listenarr_api_key = ""
+listenarr_quality_profile_id = ["Spoken"]  # can be name or id value - include multiple to allow the user to choose
+listenarr_metadata_profile_id = ["Standard"]  # can be name or id value - include multiple to allow the user to choose
+listenarr_add_monitored = True
+listenarr_search_on_add = True
+listenarr_tag_with_username = True
+listenarr_forced_tags = []  # e.g. ["searcharr", "friends-and-family"] - leave empty for none
+listenarr_allow_user_to_select_tags = True
+listenarr_user_selectable_tags = []  # e.g. ["custom-tag-1", "custom-tag-2"] - leave empty to let user choose from all tags in listenarr
+listenarr_book_command_aliases = ["audio", "audiobooks"]  # e.g. ["book", "bk", "b"]
+listenarr_book_paths = []  # e.g. ["/books", "/other-books"] - can be full path or id value - leave empty to enable all

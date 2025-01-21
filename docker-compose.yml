@@ -1,8 +1,11 @@
 version: '3.0'
 services:
   searcharr:
+    build:
+        context: .  # Path to directory containing Dockerfile
+        dockerfile: Dockerfile
     container_name: searcharr
-    image: toddrob/searcharr:latest
+    # image: toddrob/searcharr:latest
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
